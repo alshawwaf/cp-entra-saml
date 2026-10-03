@@ -15,7 +15,8 @@ REPLY = "https://gw.example.com/connect/spPortal/ACS/Login/u1"
 class FakeMgmt:
     api_version = "2.2"
 
-    def __init__(self, method="username and password", attached=None, main_url="https://gw.example.com/connect",
+    # Method values are spelled the way the management server returns them, not the way requests send them.
+    def __init__(self, method="user_pass", attached=None, main_url="https://gw.example.com/connect",
                  objects=None, bba=True):
         self.method, self.attached, self.main_url, self.bba = method, list(attached or []), main_url, bba
         self.objects = dict(objects or {})
@@ -29,7 +30,8 @@ class FakeMgmt:
         return "simple-gateway", {"fake": True}
 
     def portal_state(self, obj):
-        return {"identity_awareness": True, "browser_based_authentication": self.bba, "method": self.method,
+        return {"name": "GW", "identity_awareness": True, "browser_based_authentication": self.bba,
+                "method": self.method, "uses_identity_provider": checkpoint.is_idp_method(self.method),
                 "identity_providers": list(self.attached), "users_directories": None, "main_url": self.main_url}
 
     def show_identity_provider(self, name):
@@ -47,11 +49,12 @@ class FakeMgmt:
 
     def set_portal_identity_providers(self, kind, name, idps):
         self.log.append("portal:" + ",".join(idps))
-        self.method, self.attached, self.changed = checkpoint.METHOD_IDP, list(idps), True
+        self.method, self.attached, self.changed = "identity_provider", list(idps), True
 
     def set_portal_method(self, kind, name, method):
         self.log.append("method:" + method)
-        self.method, self.attached, self.changed = method, [], True
+        self.method = {"username and password": "user_pass", "defined on user record": "defined_on_user"}[method]
+        self.attached, self.changed = [], True
 
     def delete_identity_provider(self, name):
         self.log.append("delete-idp:" + name)
@@ -123,13 +126,18 @@ def run_setup(mgmt, graph=None, confirm=True, **kw):
     return summary, "\n".join(out)
 
 
+OURS = {"name": "EntraID_GW", "service": checkpoint.IA_SERVICE, "gateway": {"name": "GW"},
+        "required-identifier": ENTITY, "reply-urls": [REPLY]}
+
+
 class Setup(unittest.TestCase):
     def test_full_run_in_the_right_order(self):
         mgmt, graph = FakeMgmt(), FakeGraph()
         summary, text = run_setup(mgmt, graph, principals=["user@example.com", "VPN Users"], policy_package="Standard")
         self.assertEqual(graph.log, [
             "create-app", "saml:https://gw.example.com/connect", "cert", "metadata:THUMB",
-            "sp-values:%s|%s" % (ENTITY, REPLY), "assign:p-user@example.com", "assign:p-VPN Users"])
+            "sp-values:%s|%s" % (ENTITY, REPLY), "assignment-required:True",
+            "assign:p-user@example.com", "assign:p-VPN Users"])
         self.assertEqual(mgmt.log, ["check-api", "put-idp:EntraID_GW", "portal:EntraID_GW", "publish", "install:Standard:GW"])
         self.assertEqual(summary["entity_id"], ENTITY)
         self.assertTrue(summary["policy_installed"])
@@ -163,17 +171,17 @@ class Setup(unittest.TestCase):
         self.assertEqual(graph.log, [])
 
     def test_other_identity_providers_are_kept_by_default(self):
-        mgmt = FakeMgmt(method=checkpoint.METHOD_IDP, attached=["Okta"])
+        mgmt = FakeMgmt(method="identity_provider", attached=["Okta"])
         run_setup(mgmt, FakeGraph())
         self.assertIn("portal:Okta,EntraID_GW", mgmt.log)
 
     def test_only_replaces_the_list(self):
-        mgmt = FakeMgmt(method=checkpoint.METHOD_IDP, attached=["Okta"])
+        mgmt = FakeMgmt(method="identity_provider", attached=["Okta"])
         run_setup(mgmt, FakeGraph(), exclusive=True)
         self.assertIn("portal:EntraID_GW", mgmt.log)
 
     def test_stale_list_is_ignored_when_portal_uses_passwords(self):
-        mgmt = FakeMgmt(method="username and password", attached=["Old"])
+        mgmt = FakeMgmt(method="user_pass", attached=["Old"])
         run_setup(mgmt, FakeGraph())
         self.assertIn("portal:EntraID_GW", mgmt.log)
 
@@ -197,8 +205,42 @@ class Setup(unittest.TestCase):
 
     def test_unassigned_application_is_called_out(self):
         _, text = run_setup(FakeMgmt(), FakeGraph())
-        self.assertIn("nobody is assigned", text)
+        self.assertIn("nobody assigned", text)
         self.assertIn("install the Access Control policy", text)
+
+
+class Safeguards(unittest.TestCase):
+    def test_entra_dry_run_shows_the_entra_steps_without_contacting_entra(self):
+        mgmt = FakeMgmt()
+        _, text = run_setup(mgmt, None, use_entra=True, dry_run=True, principals=["a@example.com"])
+        self.assertIn("Entra: create or reuse the enterprise application", text)
+        self.assertIn("allow sign-in for a@example.com", text)
+        self.assertNotIn("You: enter", text)
+
+    def test_object_of_another_service_stops_the_run_before_entra_is_touched(self):
+        mgmt = FakeMgmt(objects={"EntraID_GW": dict(OURS, service="vpn")})
+        graph = FakeGraph()
+        with self.assertRaises(ops.Abort) as cm:
+            run_setup(mgmt, graph)
+        self.assertIn("--idp-name", str(cm.exception))
+        self.assertEqual(graph.log, [])
+        self.assertEqual(mgmt.log, ["check-api"])
+
+    def test_unknown_user_stops_the_run_before_anything_is_created(self):
+        class Strict(FakeGraph):
+            def resolve_principal(self, ref):
+                raise ops.Abort("no such user")
+        mgmt, graph = FakeMgmt(), Strict()
+        with self.assertRaises(ops.Abort):
+            run_setup(mgmt, graph, principals=["typo@example.com"])
+        self.assertEqual(graph.log, [])
+        self.assertEqual(mgmt.log, ["check-api"])
+
+    def test_root_check_reads_urls_without_a_scheme(self):
+        for url in ("https://gw.example.com", "https://gw.example.com/", "gw.example.com", " HTTPS://gw.example.com/?x=1"):
+            self.assertTrue(ops.main_url_is_root(url), url)
+        for url in ("https://gw.example.com/connect", "https://gw.example.com/connect/", "gw.example.com/portal", "", None):
+            self.assertFalse(ops.main_url_is_root(url), url)
 
 
 class OtherIdentityProvider(unittest.TestCase):
@@ -246,7 +288,7 @@ class Status(unittest.TestCase):
         self.assertTrue(result["mismatch"])
 
     def test_warns_about_root_portal_with_saml(self):
-        mgmt = FakeMgmt(method=checkpoint.METHOD_IDP, attached=["X"], main_url="https://gw.example.com/")
+        mgmt = FakeMgmt(method="identity_provider", attached=["X"], main_url="https://gw.example.com/")
         out = []
         ops.status(out.append, mgmt, "GW")
         self.assertIn("WARNING", "\n".join(out))
@@ -264,10 +306,34 @@ class Teardown(unittest.TestCase):
         self.assertEqual(graph.log, ["delete-app"])
 
     def test_keeps_other_identity_providers(self):
-        mgmt = FakeMgmt(method=checkpoint.METHOD_IDP, attached=["Okta", "EntraID_GW"],
-                        objects={"EntraID_GW": {"name": "EntraID_GW"}})
+        mgmt = FakeMgmt(method="identity_provider", attached=["Okta", "EntraID_GW"], objects={"EntraID_GW": OURS})
         ops.teardown(lambda s: None, lambda q: True, mgmt, "GW", "EntraID_GW")
         self.assertEqual(mgmt.log[0], "portal:Okta")
+
+    def test_application_is_kept_when_policy_is_not_installed(self):
+        mgmt, graph = FakeMgmt(), FakeGraph()
+        run_setup(mgmt, graph)
+        graph.log.clear()
+        out = []
+        ops.teardown(out.append, lambda q: True, mgmt, "GW", "EntraID_GW", graph=graph, app_name="App")
+        self.assertEqual(graph.log, [])
+        self.assertIn("is kept", "\n".join(out))
+
+    def test_object_of_another_gateway_is_not_removed(self):
+        mgmt = FakeMgmt(objects={"EntraID_GW": dict(OURS, gateway={"name": "OtherGW"})})
+        with self.assertRaises(ops.Abort):
+            ops.teardown(lambda s: None, lambda q: True, mgmt, "GW", "EntraID_GW")
+        self.assertEqual(mgmt.log, [])
+
+    def test_stale_reference_is_dropped_without_changing_the_method(self):
+        mgmt = FakeMgmt(method="defined_on_user", attached=["EntraID_GW"], objects={"EntraID_GW": OURS})
+        ops.teardown(lambda s: None, lambda q: True, mgmt, "GW", "EntraID_GW")
+        self.assertEqual(mgmt.log, ["method:defined on user record", "delete-idp:EntraID_GW", "publish"])
+
+    def test_works_when_the_portal_was_already_switched_off(self):
+        mgmt = FakeMgmt(bba=False, objects={"EntraID_GW": OURS})
+        ops.teardown(lambda s: None, lambda q: True, mgmt, "GW", "EntraID_GW")
+        self.assertEqual(mgmt.log, ["delete-idp:EntraID_GW", "publish"])
 
     def test_nothing_to_do_publishes_nothing(self):
         mgmt = FakeMgmt()

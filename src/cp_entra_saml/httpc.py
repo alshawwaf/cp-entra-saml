@@ -156,6 +156,10 @@ class Client:
             return Response(r.status, r.getheaders(), data, url)
         except HttpError:
             raise
+        except ValueError:
+            # http.client quotes the offending header in its message, and a header can hold a token.
+            raise HttpError("%s %s was not sent: a request header contains characters that are not allowed"
+                            % (method, _origin(url))) from None
         except ssl.SSLCertVerificationError as e:
             raise HttpError(
                 "TLS certificate of %s was not accepted (%s). Pin it with its SHA-256 fingerprint, "
@@ -169,8 +173,11 @@ class Client:
                 except Exception:
                     pass
 
-    def request_retry(self, method: str, url: str, attempts: int = 4, **kw) -> Response:
-        """Retry on transport errors and on 429/502/503/504, honouring Retry-After."""
+    def request_retry(self, method: str, url: str, attempts: int = 4, idempotent: bool = True, **kw) -> Response:
+        """Retry on 429, honouring Retry-After. An idempotent request is also retried on transport
+        errors and on 502/503/504. A request that creates something may have been carried out even
+        though its answer was lost, so it is not sent twice."""
+        retry_status = (429, 502, 503, 504) if idempotent else (429,)
         delay = 2.0
         last: Optional[Exception] = None
         for i in range(attempts):
@@ -179,9 +186,11 @@ class Client:
             except PinMismatch:
                 raise
             except HttpError as e:
+                if not idempotent:
+                    raise
                 last = e
             else:
-                if r.status not in (429, 502, 503, 504) or i == attempts - 1:
+                if r.status not in retry_status or i == attempts - 1:
                     return r
                 ra = r.header("Retry-After")
                 if ra and ra.isdigit():

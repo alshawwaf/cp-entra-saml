@@ -34,9 +34,12 @@ class Abort(Exception):
 
 
 def main_url_is_root(main_url: Optional[str]) -> bool:
-    if not main_url:
+    url = (main_url or "").strip()
+    if not url:
         return False
-    return urllib.parse.urlsplit(main_url).path.strip("/") == ""
+    if "://" not in url:
+        url = "https://" + url
+    return urllib.parse.urlsplit(url).path.strip("/") == ""
 
 
 def load_metadata(source: str, client: httpc.Client) -> bytes:
@@ -52,41 +55,62 @@ def load_metadata(source: str, client: httpc.Client) -> bytes:
         raise Abort("could not read the metadata file: %s" % e) from e
 
 
-def describe_gateway(say: Say, mgmt: checkpoint.Management, gateway: str):
+def describe_gateway(say: Say, mgmt: checkpoint.Management, gateway: str, require_portal: bool = True):
+    """Returns (kind, state). state['name'] is the object's name as the management server spells it."""
     kind, obj = mgmt.show_gateway(gateway)
     state = mgmt.portal_state(obj)
-    say("Gateway %s (%s), management API %s" % (gateway, kind.replace("simple-", ""), mgmt.api_version or "?"))
+    state["name"] = state.get("name") or gateway
+    say("Gateway %s (%s), management API %s" % (state["name"], kind.replace("simple-", ""), mgmt.api_version or "?"))
     say("  Portal Main URL:        %s" % (state["main_url"] or "not set"))
     say("  Portal authentication:  %s%s" % (
         state["method"] or "unknown",
         " [%s]" % ", ".join(state["identity_providers"]) if state["identity_providers"] else ""))
-    if not state["identity_awareness"] or not state["browser_based_authentication"]:
+    if require_portal and not (state["identity_awareness"] and state["browser_based_authentication"]):
         raise Abort("Identity Awareness with Browser-Based Authentication is not enabled on %s. Enable it first "
-                    "(gateway object > Identity Awareness > Browser-Based Authentication)." % gateway)
+                    "(gateway object > Identity Awareness > Browser-Based Authentication)." % state["name"])
     return kind, state
 
 
+def _attached(state: dict) -> List[str]:
+    """Identity providers the portal really uses. The list can outlive a switch to another method."""
+    return list(state["identity_providers"]) if state["uses_identity_provider"] else []
+
+
 def setup(say: Say, confirm: Callable[[str], bool], mgmt: checkpoint.Management, gateway: str, idp_name: str,
-          graph: Optional[entra.Graph] = None, app_name: Optional[str] = None,
+          graph: Optional[entra.Graph] = None, app_name: Optional[str] = None, use_entra: Optional[bool] = None,
           metadata_source: Optional[str] = None, metadata_client: Optional[httpc.Client] = None,
           principals: Optional[List[str]] = None, everyone: bool = False,
           policy_package: Optional[str] = None, exclusive: bool = False,
           allow_root_portal: bool = False, dry_run: bool = False) -> dict:
-    """Returns a summary dict. Raises Abort with nothing published when a precondition fails."""
+    """Returns a summary dict. Raises Abort with nothing published when a precondition fails.
+
+    use_entra says which identity provider the run is for; graph may still be None in a dry run,
+    which contacts no identity provider."""
+    if use_entra is None:
+        use_entra = graph is not None
     mgmt.require_identity_provider_api()
     kind, state = describe_gateway(say, mgmt, gateway)
+    gateway = state["name"]
     if main_url_is_root(state["main_url"]) and not allow_root_portal:
         raise Abort(ROOT_PORTAL_EXPLANATION)
 
     existing_idp = mgmt.show_identity_provider(idp_name)
-    attached = state["identity_providers"] if state["method"] == checkpoint.METHOD_IDP else []
-    target_list = [idp_name] if exclusive else list(dict.fromkeys(attached + [idp_name]))
+    if existing_idp is not None:
+        problem = checkpoint.foreign_identity_provider(existing_idp, gateway)
+        if problem:
+            raise Abort(problem)
+    attached = _attached(state)
+    kept = [n for n in attached if not checkpoint.same_name(n, idp_name)]
+    target_list = [idp_name] if exclusive else kept + [idp_name]
 
     tenant = app = sp = None
+    resolved: List[dict] = []
     if graph is not None:
         tenant = graph.tenant()
         app = graph.find_application(app_name or "")
         say("Entra tenant %s (%s)" % (tenant["name"], tenant["domain"] or tenant["id"]))
+        # Resolve names now: a typo should stop the run before anything is created.
+        resolved = [graph.resolve_principal(ref) for ref in principals or []]
 
     say("")
     say("Plan")
@@ -97,24 +121,26 @@ def setup(say: Say, confirm: Callable[[str], bool], mgmt: checkpoint.Management,
         step += 1
         say("  %d. %s" % (step, text))
 
-    if graph is not None:
-        plan("Entra: %s enterprise application %r with SAML sign-on"
-             % ("reuse the" if app else "create the", app_name))
+    if use_entra:
+        verb = "create or reuse the" if graph is None else ("reuse the" if app else "create the")
+        plan("Entra: %s enterprise application %r with SAML sign-on and a signing certificate" % (verb, app_name))
     plan("Check Point: %s identity provider object %r for %s (Identity Awareness)"
          % ("refresh the" if existing_idp else "create the", idp_name, gateway))
-    if graph is not None:
+    if use_entra:
         plan("Entra: write the gateway's Identifier and Reply URL into the application")
         if everyone:
             plan("Entra: let every user of the tenant sign in (no assignment required)")
         elif principals:
-            plan("Entra: allow sign-in for %s" % ", ".join(principals))
+            plan("Entra: require assignment, and allow sign-in for %s"
+                 % ", ".join(p["name"] for p in resolved) if resolved else
+                 "Entra: require assignment, and allow sign-in for %s" % ", ".join(principals))
     else:
         plan("You: enter the Identifier and Reply URL printed below at your identity provider")
     plan("Check Point: portal authentication -> identity provider [%s]%s"
-         % (", ".join(target_list), "" if exclusive or len(target_list) == 1 else " (existing providers kept; users choose)"))
+         % (", ".join(target_list), "" if len(target_list) == 1 else " (existing providers kept; users choose)"))
     plan("Check Point: publish%s" % (", install policy %r on %s" % (policy_package, gateway) if policy_package
                                       else " (policy is NOT installed; pass --install-policy <package>)"))
-    if state["method"] != checkpoint.METHOD_IDP:
+    if not state["uses_identity_provider"]:
         say("  Note: users of this portal sign in with %r today. After step %d they sign in through the identity provider."
             % (state["method"], step - 1))
     if dry_run:
@@ -143,7 +169,8 @@ def setup(say: Say, confirm: Callable[[str], bool], mgmt: checkpoint.Management,
         say("Entra: SAML sign-on enabled, signing certificate %s" % thumb)
         metadata = graph.federation_metadata(tenant["id"], app["appId"], thumb)
     else:
-        assert metadata_source and metadata_client
+        if not (metadata_source and metadata_client):
+            raise Abort("no identity provider was given: use --tenant for Microsoft Entra or --idp-metadata")
         metadata = load_metadata(metadata_source, metadata_client)
     try:
         md = saml.parse_metadata(metadata)
@@ -173,16 +200,17 @@ def setup(say: Say, confirm: Callable[[str], bool], mgmt: checkpoint.Management,
         if everyone:
             graph.set_assignment_required(sp["id"], False)
             say("Entra: every user of the tenant may sign in")
-        for ref in principals or []:
-            p = graph.resolve_principal(ref)
-            new = graph.assign(sp["id"], p["id"])
-            say("Entra: %s %s %s" % (p["kind"], p["name"], "assigned" if new else "was already assigned"))
-        if not everyone and not principals:
-            say("Entra: nobody is assigned yet. Assign users or groups to the application, or run again with "
-                "--assign / --everyone.")
+        elif resolved:
+            graph.set_assignment_required(sp["id"], True)
+            for p in resolved:
+                new = graph.assign(sp["id"], p["id"])
+                say("Entra: %s %s %s" % (p["kind"], p["name"], "assigned" if new else "was already assigned"))
+        else:
+            say("Entra: assignments were left as they are (no --assign or --everyone). A new application has "
+                "nobody assigned, so nobody can sign in until you assign users or groups.")
 
     # 4. Gateway.
-    if state["method"] != checkpoint.METHOD_IDP or attached != target_list:
+    if attached != target_list:
         mgmt.set_portal_identity_providers(kind, gateway, target_list)
     mgmt.publish()
     say("Check Point: published")
@@ -224,28 +252,34 @@ def verify_portal(say: Say, main_url: str, client: httpc.Client, expected_entity
 
 def status(say: Say, mgmt: checkpoint.Management, gateway: str, graph: Optional[entra.Graph] = None,
            app_name: Optional[str] = None) -> dict:
-    kind, state = describe_gateway(say, mgmt, gateway)
+    kind, state = describe_gateway(say, mgmt, gateway, require_portal=False)
+    gateway = state["name"]
+    attached = _attached(state)
     try:
         mgmt.require_identity_provider_api()
-        objs = [o for o in mgmt.list_identity_providers()
-                if o.get("service") == checkpoint.IA_SERVICE and gateway in checkpoint._names(o.get("gateway"))]
+        objs = [o for o in mgmt.list_identity_providers() if checkpoint.belongs_to_portal(o, gateway)]
     except checkpoint.Unsupported as e:
         say("  %s" % e)
         objs = []
+
+    def used(o: dict) -> bool:
+        return any(checkpoint.same_name(o.get("name"), n) for n in attached)
+
     say("")
     say("Identity provider objects for this gateway's portal: %s" % (len(objs) or "none"))
     for o in objs:
         spv = checkpoint.service_provider_values(o)
-        used = o.get("name") in state["identity_providers"] and state["method"] == checkpoint.METHOD_IDP
-        say("  %s%s" % (o.get("name"), "" if used else "   (not attached to the portal)"))
+        say("  %s%s" % (o.get("name"), "" if used(o) else "   (not attached to the portal)"))
         say("    Identifier (Entity ID): %s" % spv["entity_id"])
         for u in spv["reply_urls"]:
             say("    Reply URL (ACS):        %s" % u)
         say("    Identity provider:      %s" % (o.get("received-identifier") or "from metadata file"))
-    result = {"state": state, "objects": objs, "mismatch": False}
-    if graph is not None and app_name:
+    result = {"state": state, "objects": objs, "mismatch": False, "entity_id": None, "reply_urls": None}
+    say("")
+    if graph is None or not app_name:
+        say("Entra was not checked (no --tenant).")
+    else:
         app = graph.find_application(app_name)
-        say("")
         if app is None:
             say("Entra: no application named %r" % app_name)
             result["mismatch"] = True
@@ -256,18 +290,24 @@ def status(say: Say, mgmt: checkpoint.Management, gateway: str, graph: Optional[
             say("  Identifier (Entity ID): %s" % (", ".join(ids) or "not set"))
             say("  Reply URL (ACS):        %s" % (", ".join(replies) or "not set"))
             match = [o for o in objs if o.get("required-identifier") in ids]
+            in_use = [o for o in match if used(o)]
             if not match:
                 say("  MISMATCH: none of the gateway's identity provider objects has this Identifier.")
                 result["mismatch"] = True
+            elif not in_use:
+                say("  MISMATCH: object %s has this Identifier but is not attached to the portal."
+                    % match[0].get("name"))
+                result["mismatch"] = True
             else:
-                want = checkpoint.service_provider_values(match[0])["reply_urls"]
-                missing = [u for u in want if u not in replies]
+                want = checkpoint.service_provider_values(in_use[0])
+                missing = [u for u in want["reply_urls"] if u not in replies]
                 if missing:
                     say("  MISMATCH: Reply URL %s is not registered in Entra." % ", ".join(missing))
                     result["mismatch"] = True
                 else:
-                    say("  Matches Check Point object %s." % match[0].get("name"))
-    if main_url_is_root(state["main_url"]) and state["method"] == checkpoint.METHOD_IDP:
+                    say("  Matches Check Point object %s." % in_use[0].get("name"))
+                    result["entity_id"], result["reply_urls"] = want["entity_id"], want["reply_urls"]
+    if main_url_is_root(state["main_url"]) and state["uses_identity_provider"]:
         say("")
         say("WARNING: " + ROOT_PORTAL_EXPLANATION)
     return result
@@ -276,29 +316,55 @@ def status(say: Say, mgmt: checkpoint.Management, gateway: str, graph: Optional[
 def teardown(say: Say, confirm: Callable[[str], bool], mgmt: checkpoint.Management, gateway: str, idp_name: str,
              graph: Optional[entra.Graph] = None, app_name: Optional[str] = None,
              restore_method: str = "username and password", policy_package: Optional[str] = None) -> None:
-    kind, state = describe_gateway(say, mgmt, gateway)
+    kind, state = describe_gateway(say, mgmt, gateway, require_portal=False)
+    gateway = state["name"]
     obj = mgmt.show_identity_provider(idp_name)
-    attached = state["identity_providers"] if state["method"] == checkpoint.METHOD_IDP else []
-    remaining = [n for n in attached if n != idp_name]
+    if obj is not None:
+        problem = checkpoint.foreign_identity_provider(obj, gateway)
+        if problem:
+            raise Abort("%r is not this portal's identity provider object: it belongs to %s on %s."
+                        % (idp_name, obj.get("service"), ", ".join(checkpoint.names(obj.get("gateway"))) or "no gateway"))
+    listed = [n for n in state["identity_providers"] if checkpoint.same_name(n, idp_name)]
+    remaining = [n for n in state["identity_providers"] if not checkpoint.same_name(n, idp_name)]
+    in_idp_mode = state["uses_identity_provider"]
     app = graph.find_application(app_name) if graph is not None and app_name else None
+    # Removing the application while the gateway still redirects to it would lock users out.
+    delete_app = app is not None and (bool(policy_package) or not (listed and in_idp_mode))
 
     say("")
     say("Plan")
-    if idp_name in attached:
+    if listed and in_idp_mode:
         say("  - Check Point: portal authentication -> %s"
             % ("identity provider [%s]" % ", ".join(remaining) if remaining else restore_method))
+    elif listed:
+        say("  - Check Point: remove the leftover reference to %r from the gateway" % idp_name)
     say("  - Check Point: %s" % ("delete identity provider object %r" % idp_name if obj else "no object named %r" % idp_name))
     say("  - Check Point: publish%s" % (", install policy %r" % policy_package if policy_package else ""))
     if graph is not None:
-        say("  - Entra: %s" % ("delete application %r" % app_name if app else "no application named %r" % app_name))
+        if app is None:
+            say("  - Entra: no application named %r" % app_name)
+        elif delete_app:
+            say("  - Entra: delete application %r" % app_name)
+        else:
+            say("  - Entra: application %r is kept, because the gateway keeps redirecting to it until policy is "
+                "installed. Run again with --install-policy to remove it." % app_name)
     if not confirm("Remove this configuration?"):
         raise Abort("cancelled; nothing was changed")
 
-    if idp_name in attached:
-        if remaining:
+    if listed:
+        if in_idp_mode and remaining:
             mgmt.set_portal_identity_providers(kind, gateway, remaining)
-        else:
+        elif in_idp_mode:
             mgmt.set_portal_method(kind, gateway, restore_method)
+        else:
+            # The portal already uses another method; keep it, and only drop the stale reference.
+            current = checkpoint.request_method(state["method"])
+            if current:
+                mgmt.set_portal_method(kind, gateway, current)
+            else:
+                say("Check Point: the gateway still lists %r but its authentication method (%s) is not one this "
+                    "tool can restate; if the delete is refused, remove the reference in SmartConsole."
+                    % (idp_name, state["method"]))
     if obj:
         mgmt.delete_identity_provider(idp_name)
     if mgmt.changed:
@@ -309,7 +375,7 @@ def teardown(say: Say, confirm: Callable[[str], bool], mgmt: checkpoint.Manageme
             say("Check Point: policy installed")
         else:
             say("Check Point: install the Access Control policy on %s to make this effective" % gateway)
-    if app is not None and graph is not None:
+    if delete_app and graph is not None:
         sp = graph.service_principal_for(app["appId"])
         graph.delete_application(app["id"], sp["id"] if sp else None)
         say("Entra: application %s deleted (recoverable from 'Deleted applications' for 30 days)" % app_name)

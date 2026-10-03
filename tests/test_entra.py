@@ -31,7 +31,9 @@ class FakeHttp:
         raw = payload if isinstance(payload, bytes) else (b"" if payload is None else json.dumps(payload).encode())
         return httpc.Response(status, [], raw, url)
 
-    request_retry = request
+    def request_retry(self, method, url, attempts=4, idempotent=True, **kw):
+        self.idempotent = getattr(self, "idempotent", []) + [(method, idempotent)]
+        return self.request(method, url, **kw)
 
     def paths(self, method=None):
         return [c[1] for c in self.calls if method in (None, c[0])]
@@ -154,19 +156,21 @@ class Metadata(NoSleep):
 
 
 class ServiceProviderValues(NoSleep):
-    ROUTES = {("GET", "/v1.0/applications/obj"): (200, {"id": "obj", "web": {"redirectUris": ["https://*"], "logoutUrl": "https://x/out"}})}
+    ROUTES = {}
 
     def routes(self, extra):
         merged = dict(self.ROUTES)
         merged.update(extra)
         return merged
 
-    def test_identifier_and_reply_url_are_written_keeping_other_web_settings(self):
+    def test_only_the_identifier_and_reply_url_are_sent(self):
         g, http = graph(self.routes({("PATCH", "/v1.0/applications/obj"): (204, None)}))
         g.set_service_provider("obj", "https://gw/id", ["https://gw/acs"])
         body = [c[2] for c in http.calls if c[0] == "PATCH"][0]
         self.assertEqual(body["identifierUris"], ["https://gw/id"])
-        self.assertEqual(body["web"], {"redirectUris": ["https://gw/acs"], "logoutUrl": "https://x/out"})
+        # Nothing read back from the application is echoed: PATCH merges, and stale entries would conflict.
+        self.assertEqual(body, {"identifierUris": ["https://gw/id"], "web": {"redirectUris": ["https://gw/acs"]}})
+        self.assertEqual(http.paths("GET"), [])
 
     def test_retries_while_saml_mode_is_still_propagating(self):
         refused = (400, {"error": {"code": "HostNameNotOnVerifiedDomain", "message": "Failed to add identifier URI https://gw/id"}})
@@ -206,10 +210,33 @@ class Assignment(NoSleep):
         self.assertEqual(g.resolve_principal("a@x.com")["kind"], "user")
         self.assertEqual(g.resolve_principal("VPN Users"), {"id": "g", "name": "VPN Users", "kind": "group"})
 
+    def test_object_id_is_looked_up_as_user_then_group(self):
+        gid = "11111111-2222-3333-4444-555555555555"
+        g, http = graph({("GET", "/v1.0/users/" + gid): (404, {"error": {"code": "Request_ResourceNotFound"}}),
+                         ("GET", "/v1.0/groups/" + gid): (200, {"id": gid, "displayName": "VPN Users"})})
+        self.assertEqual(g.resolve_principal(gid), {"id": gid, "name": "VPN Users", "kind": "group"})
+
     def test_ambiguous_group_name_is_refused(self):
         g, _ = graph({("GET", "/v1.0/groups"): (200, {"value": [{"id": "1"}, {"id": "2"}]})})
         with self.assertRaises(entra.GraphError):
             g.resolve_principal("Sales")
+
+
+class Retries(NoSleep):
+    def test_a_post_whose_answer_is_lost_is_not_sent_again(self):
+        made = {"application": {"id": "obj", "appId": "app"}, "servicePrincipal": {"id": "sp"}}
+        g, http = graph({("POST", "/v1.0/applicationTemplates/%s/instantiate" % entra.NON_GALLERY_TEMPLATE): (201, made),
+                         ("GET", "/v1.0/servicePrincipals/sp"): (200, {"id": "sp"}),
+                         ("GET", "/v1.0/applications/obj"): (200, {"id": "obj"})})
+        g.create_saml_application("App")
+        self.assertIn(("POST", False), http.idempotent)
+        self.assertIn(("GET", True), http.idempotent)
+
+    def test_device_code_survives_a_transient_token_endpoint_failure(self):
+        http = FakeHttp({("POST", "/%s/oauth2/v2.0/devicecode" % TENANT): DEVICE,
+                         ("POST", TOKEN_PATH): [(503, b"<html>busy</html>"), (400, {"error": "temporarily_unavailable"}),
+                                                (200, {"access_token": "AT"})]})
+        self.assertEqual(entra.device_code_login(http, TENANT, prompt=lambda m: None), "AT")
 
 
 class Removal(NoSleep):

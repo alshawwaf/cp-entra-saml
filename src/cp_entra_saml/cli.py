@@ -11,6 +11,9 @@ from typing import Dict, List, Optional
 from . import __version__, checkpoint, entra, har, httpc, ops, portal
 
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
+# Default names. The gateway name is filled in.
+ENTRA_OBJECT, OTHER_OBJECT = "EntraID_%s", "SAML_IdP_%s"
+APP_NAME = "Check Point Captive Portal (%s)"
 
 
 def say(message: str = "") -> None:
@@ -82,11 +85,16 @@ def management_login(args, read_only: bool = False) -> checkpoint.Management:
     return mgmt
 
 
-def graph_login(args, assigning: bool = False) -> entra.Graph:
+def wants_entra(args) -> bool:
+    return bool(args.tenant or args.use_az_cli or os.environ.get("GRAPH_ACCESS_TOKEN"))
+
+
+def graph_login(args, scopes=entra.SCOPES_BASE) -> entra.Graph:
     client = httpc.Client(timeout=60)
-    scopes = entra.SCOPES_BASE + (entra.SCOPES_ASSIGN if assigning else ())
-    token = os.environ.get("GRAPH_ACCESS_TOKEN")
+    token = (os.environ.get("GRAPH_ACCESS_TOKEN") or "").strip()
     if token:
+        if any(c.isspace() or ord(c) < 32 for c in token):
+            raise ops.Abort("GRAPH_ACCESS_TOKEN contains whitespace or control characters; set it to the bare token")
         say("Entra: using the token from GRAPH_ACCESS_TOKEN")
     elif args.use_az_cli:
         token = entra.azure_cli_token(args.tenant)
@@ -122,17 +130,19 @@ def cmd_setup(args) -> int:
                     "or --idp-metadata <file or URL> for any other SAML identity provider")
     if args.assign and args.everyone:
         return fail("--assign and --everyone are alternatives")
-    idp_name = args.idp_name or ("EntraID_%s" % args.gateway if not args.idp_metadata else "SAML_IdP_%s" % args.gateway)
-    app_name = args.app_name or "Check Point Captive Portal (%s)" % args.gateway
+    use_entra = not args.idp_metadata
+    idp_name = args.idp_name or ((ENTRA_OBJECT if use_entra else OTHER_OBJECT) % args.gateway)
+    app_name = (args.app_name or APP_NAME % args.gateway)[:120]
+    # Sign in at Microsoft first: it can take minutes, and the management session should not sit idle meanwhile.
+    graph = None
+    if use_entra and not args.dry_run:
+        graph = graph_login(args, entra.SCOPES_BASE + (entra.SCOPES_ASSIGN if args.assign else ()))
+    elif use_entra:
+        say("Dry run: Entra is not contacted.")
     mgmt = management_login(args, read_only=args.dry_run)
     try:
-        graph = None
-        if not args.idp_metadata and not args.dry_run:
-            graph = graph_login(args, assigning=bool(args.assign))
-        elif not args.idp_metadata:
-            say("Dry run: Entra is not contacted.")
         summary = ops.setup(
-            say, confirmer(args), mgmt, args.gateway, idp_name, graph=graph, app_name=app_name,
+            say, confirmer(args), mgmt, args.gateway, idp_name, graph=graph, app_name=app_name, use_entra=use_entra,
             metadata_source=args.idp_metadata, metadata_client=httpc.Client(timeout=30),
             principals=args.assign, everyone=args.everyone, policy_package=args.install_policy,
             exclusive=args.only, allow_root_portal=args.allow_root_portal, dry_run=args.dry_run)
@@ -154,27 +164,33 @@ def cmd_setup(args) -> int:
 
 
 def cmd_status(args) -> int:
+    graph = graph_login(args, entra.SCOPES_READ) if wants_entra(args) else None
     mgmt = management_login(args, read_only=True)
     try:
-        graph = graph_login(args) if (args.tenant or args.use_az_cli or os.environ.get("GRAPH_ACCESS_TOKEN")) else None
-        app_name = args.app_name or "Check Point Captive Portal (%s)" % args.gateway
+        app_name = (args.app_name or APP_NAME % args.gateway)[:120]
         result = ops.status(say, mgmt, args.gateway, graph=graph, app_name=app_name if graph else None)
     finally:
         mgmt.logout()
     main_url = result["state"].get("main_url")
     ok = True
-    if main_url and not args.skip_portal_check:
+    if main_url and result["state"].get("browser_based_authentication") and not args.skip_portal_check:
         say("")
-        ok = ops.verify_portal(say, main_url, portal_client(args))
+        ok = ops.verify_portal(say, main_url, portal_client(args), result["entity_id"], result["reply_urls"])
     return EXIT_OK if ok and not result["mismatch"] else EXIT_FINDINGS
 
 
 def cmd_teardown(args) -> int:
-    idp_name = args.idp_name or "EntraID_%s" % args.gateway
-    app_name = args.app_name or "Check Point Captive Portal (%s)" % args.gateway
+    app_name = (args.app_name or APP_NAME % args.gateway)[:120]
+    graph = graph_login(args) if args.delete_entra_app else None
     mgmt = management_login(args)
     try:
-        graph = graph_login(args) if args.delete_entra_app else None
+        idp_name = args.idp_name
+        if not idp_name:
+            # setup names the object after the kind of identity provider; find which one it made.
+            found = [n % args.gateway for n in (ENTRA_OBJECT, OTHER_OBJECT) if mgmt.show_identity_provider(n % args.gateway)]
+            if len(found) > 1:
+                raise ops.Abort("both %s exist; say which to remove with --idp-name" % " and ".join(found))
+            idp_name = found[0] if found else ENTRA_OBJECT % args.gateway
         ops.teardown(say, confirmer(args), mgmt, args.gateway, idp_name, graph=graph,
                      app_name=app_name if graph else None, restore_method=args.restore_method,
                      policy_package=args.install_policy)
@@ -247,7 +263,8 @@ def _add_entra(p: argparse.ArgumentParser) -> None:
     g.add_argument("--app-name", metavar="NAME", help="enterprise application name (default: Check Point Captive Portal (<gateway>))")
     g.add_argument("--use-az-cli", action="store_true", help="use the token of an existing 'az login' session instead of a device code")
     g.add_argument("--client-id", default=entra.DEFAULT_CLIENT_ID, metavar="GUID",
-                   help="public client used for the device code sign-in (default: Microsoft Graph Command Line Tools)")
+                   help="public client application used for the sign-in (default: Microsoft Graph Command Line "
+                        "Tools). Use your own registration to limit what is consented to")
 
 
 def _add_portal_tls(p: argparse.ArgumentParser) -> None:
@@ -295,7 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--idp-name", metavar="NAME")
     g.add_argument("--delete-entra-app", action="store_true", help="also delete the Entra application")
     g.add_argument("--restore-method", default="username and password",
-                   choices=["username and password", "defined on user record", "radius"],
+                   choices=["username and password", "defined on user record"],
                    help="portal authentication to go back to when no identity provider is left")
     g.add_argument("--install-policy", metavar="PACKAGE")
     g.add_argument("--yes", action="store_true")

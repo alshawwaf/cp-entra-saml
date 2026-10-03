@@ -53,7 +53,10 @@ cp-entra-saml --help
 The tool never asks for a Microsoft password. You sign in at Microsoft, either
 with a code (`--login device`, the default) or in a browser window
 (`--login browser`, for tenants whose Conditional Access blocks the device code
-flow). `--use-az-cli` reuses an existing `az login` session instead.
+flow). `--use-az-cli` reuses an existing `az login` session instead, and a
+token in the `GRAPH_ACCESS_TOKEN` environment variable takes precedence over
+all of them. `--client-id` signs in through your own application registration
+if you prefer not to consent these permissions to Microsoft's shared one.
 
 ## Credentials for the management server
 
@@ -205,8 +208,10 @@ cp-entra-saml teardown --mgmt 192.0.2.10 --mgmt-fingerprint SHA256:... --gateway
 ```
 
 The portal goes back to user name and password (or `--restore-method`), unless
-other identity providers remain attached. A deleted Entra application can be
-restored from "Deleted applications" for 30 days.
+other identity providers remain attached. The Entra application is deleted only
+when policy is installed in the same run: until then the gateway keeps sending
+users to it. A deleted application can be restored from "Deleted applications"
+for 30 days.
 
 ## Limits
 

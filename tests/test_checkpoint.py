@@ -84,6 +84,36 @@ class Session(unittest.TestCase):
         m.logout(discard=True)
         self.assertEqual(client.commands()[-2:], ["discard", "logout"])
 
+    def test_change_whose_reply_is_lost_is_still_discarded(self):
+        def lost(body):
+            raise httpc.HttpError("read timed out")
+        m, client = logged_in({"set-simple-gateway": lost, "discard": {}, "logout": {}})
+        with self.assertRaises(httpc.HttpError):
+            m.set_portal_identity_providers("simple-gateway", "GW", ["A"])
+        m.logout(discard=True)
+        self.assertEqual(client.commands()[-2:], ["discard", "logout"])
+
+    def test_logout_still_happens_when_discard_fails(self):
+        m, client = logged_in({"set-simple-gateway": {}, "discard": (500, {"message": "no"}), "logout": {}})
+        m.set_portal_identity_providers("simple-gateway", "GW", ["A"])
+        m.logout(discard=True)
+        self.assertEqual(client.commands()[-1], "logout")
+
+    def test_read_only_login_sends_no_session_name(self):
+        client = FakeClient({"login": {"sid": "S"}})
+        checkpoint.Management("mgmt.example.com", client).login(api_key="k", read_only=True)
+        self.assertTrue(client.calls[0][1]["read-only"])
+        self.assertNotIn("session-name", client.calls[0][1])
+        self.assertNotIn("session-description", client.calls[0][1])
+
+    def test_a_page_that_is_not_json_is_an_error_even_with_status_200(self):
+        class Html(FakeClient):
+            def request(self, method, url, headers=None, body=None, json_body=None):
+                return httpc.Response(200, [], b"<html>login</html>", url)
+        with self.assertRaises(checkpoint.ApiError) as cm:
+            checkpoint.Management("wrong.example.com", Html({})).login(api_key="k")
+        self.assertIn("did not answer with JSON", str(cm.exception))
+
 
 class Gateway(unittest.TestCase):
     def test_cluster_is_found_when_not_a_single_gateway(self):
@@ -97,6 +127,29 @@ class Gateway(unittest.TestCase):
         self.assertEqual(st["method"], "identity provider")
         self.assertEqual(st["main_url"], "https://gw.example.com/connect")
         self.assertTrue(st["browser_based_authentication"])
+
+    def test_reply_spellings_of_the_method_are_understood(self):
+        for value in ("identity provider", "identity_provider", "IDENTITY_PROVIDER", "idp"):
+            self.assertTrue(checkpoint.is_idp_method(value), value)
+        for value in ("user_pass", "defined_on_user", "radius", "", None):
+            self.assertFalse(checkpoint.is_idp_method(value), value)
+        self.assertEqual(checkpoint.request_method("user_pass"), "username and password")
+        self.assertEqual(checkpoint.request_method("defined_on_user"), "defined on user record")
+        self.assertIsNone(checkpoint.request_method("radius"))
+        self.assertIsNone(checkpoint.request_method("something_new"))
+
+    def test_cluster_edit_waits_for_its_task(self):
+        m, client = logged_in({"set-simple-cluster": {"task-id": "t9"},
+                               "show-task": {"tasks": [{"task-id": "t9", "status": "failed", "task-name": "set cluster"}]}})
+        with self.assertRaises(checkpoint.TaskFailed):
+            m.set_portal_identity_providers("simple-cluster", "CL", ["A"])
+        self.assertIn("show-task", client.commands())
+
+    def test_leaving_identity_provider_mode_empties_the_list(self):
+        m, client = logged_in({"set-simple-gateway": {}})
+        m.set_portal_method("simple-gateway", "GW", "username and password")
+        auth = client.calls[-1][1]["identity-awareness-settings"]["browser-based-authentication-settings"]["authentication-settings"]
+        self.assertEqual(auth, {"authentication-method": "username and password", "identity-provider": []})
 
     def test_switching_the_portal_sets_method_and_list_together(self):
         m, client = logged_in({"set-simple-cluster": {}})
