@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cp-entra-saml"
+description = "SAML sign-in for the Check Point Identity Awareness Captive Portal with Microsoft Entra ID: set up, check, troubleshoot"
+readme = "README.md"
+requires-python = ">=3.7"
+dependencies = []
+dynamic = ["version"]
+
+[project.scripts]
+cp-entra-saml = "cp_entra_saml.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "cp_entra_saml.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

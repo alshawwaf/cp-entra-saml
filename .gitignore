@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# credentials and captures never belong in the repository
+*.env
+*.har
+*credentials*
